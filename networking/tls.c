@@ -312,7 +312,9 @@ enum {
 	GOT_CERT_RSA_KEY_ALG   = 1 << 1,
 	GOT_CERT_ECDSA_KEY_ALG = 1 << 2, // so far unused
 	GOT_EC_KEY             = 1 << 3,
-	GOT_EC_CURVE_X25519    = 1 << 4, // else P256
+	/* Client: server sent x25519 key in SERVER_KEY_EXCHANGE (else P256)
+	 * Server: we chose x25519 based on client's supported_groups (else P256) */
+	USE_EC_CURVE_X25519    = 1 << 4,
 	ENCRYPTION_AESGCM      = 1 << 5, // else AES-SHA (or NULL-SHA if ALLOW_RSA_NULL_SHA256=1)
 };
 
@@ -412,8 +414,8 @@ struct tls_handshake_data {
 	int key_type_chosen;
 	psRsaKey_t rsa_priv_key;
 
-	///* For ECDHE: server's ephemeral EC private key */
-	//uint8_t ecc_priv_key32[32];
+	/* For ECDHE: server's ephemeral EC private key */
+	uint8_t ecc_priv_key32[32];
 #endif
 };
 enum {
@@ -430,7 +432,6 @@ static int is_minor_version_valid(tls_state_t *tls, uint8_t minor_ver)
 {
 #if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
 	if (tls->expecting_first_packet == 1) {
-		tls->expecting_first_packet = 0;
 		/* First packet: accept TLS 1.0 (3.1) through TLS 1.3 (3.4)
 		 * for compatibility with clients using other record versions */
 		return (minor_ver > 0 && minor_ver <= 4);
@@ -1836,7 +1837,7 @@ static void process_server_key(tls_state_t *tls, int len)
 	switch (t32) {
 	case _0x03001d20: //curve_x25519
 		dbg("got x25519 eccPubKey");
-		tls->flags |= GOT_EC_CURVE_X25519;
+		tls->flags |= USE_EC_CURVE_X25519;
 		memcpy(tls->hsd->ecc_pub_key32, keybuf, 32);
 		break;
 	case _0x03001741: //curve_secp256r1 (aka P256)
@@ -2001,7 +2002,7 @@ static void send_client_key_exchange(tls_state_t *tls)
 		if (!(tls->flags & GOT_EC_KEY))
 			bb_simple_error_msg_and_die("server did not provide EC key");
 
-		if (tls->flags & GOT_EC_CURVE_X25519) {
+		if (tls->flags & USE_EC_CURVE_X25519) {
 			/* ECDHE, curve x25519 */
 			dbg("computing x25519_premaster");
 			curve_x25519_compute_pubkey_and_premaster(
@@ -2431,7 +2432,8 @@ static void get_client_hello(tls_state_t *tls)
 	unsigned i, j;
 	struct client_hello *hp;
 	uint8_t *p;
-	unsigned cipher_list_len;
+	int cipher_list_len;
+	int extensions_len;
 	int len;
 
 	len = tls_xread_handshake_block(tls, sizeof(*hp));
@@ -2439,9 +2441,9 @@ static void get_client_hello(tls_state_t *tls)
 	hp = (void*)(tls->inbuf + RECHDR_LEN);
 	if (hp->type != HANDSHAKE_CLIENT_HELLO
 	 || hp->len24_hi  != 0
-	 /* hp->len24_mid,lo checked later */
+	 || len != ((hp->len24_mid << 8) | hp->len24_lo) + 4
 	 || hp->proto_maj != TLS_MAJ
-///?	 || hp->proto_min != TLS_MIN
+	 || !is_minor_version_valid(tls, hp->proto_min)
 	) {
 		bad_record_die(tls, "'client hello'", len);
 	}
@@ -2453,13 +2455,13 @@ static void get_client_hello(tls_state_t *tls)
 	/* Parse cipher suites to select one we support */
 	p = (uint8_t*)(hp + 1);
 
-	/* Skip session ID */
-	len -= RECHDR_LEN + sizeof(*hp);
-	if (len < hp->session_id_len) {
-		bb_simple_error_msg_and_die("malformed ClientHello");
-	}
+	/* Skip session ID and handshake header */
+	len -= sizeof(*hp);
 	p += hp->session_id_len;
 	len -= hp->session_id_len;
+	if (len < 0) {
+		bb_simple_error_msg_and_die("malformed ClientHello");
+	}
 
 	/* Parse cipher suite list */
 	if (len < 2) {
@@ -2477,16 +2479,6 @@ static void get_client_hello(tls_state_t *tls)
 	for (i = 0; i < NUM_CIPHERS*2; i += 2) {
 		const uint8_t *our_cipher = &supported_ciphers[i];
 		int key_type;
-
-		/* Skip all ECDHE ciphers (0xC0xx) - we don't support server-side ephemeral
-		 * EC key generation yet. ECDHE_RSA uses RSA certificates (which we have)
-		 * but still requires generating ephemeral EC keys for the key exchange.
-		 * We only support plain RSA key exchange (0x00xx) on the server side.
-		 */
-		if (our_cipher[0] == 0xC0) {
-			//TODO: implement server-side ECDHE
-			continue;
-		}
 
 		/* Determine required key type for this cipher */
 		key_type = is_cipher_ECDSA(our_cipher);
@@ -2510,12 +2502,78 @@ static void get_client_hello(tls_state_t *tls)
 				set_cipher_parameters(tls, our_cipher);
 				dbg("Selected cipher: %04x", tls->cipher_id);
 				tls->hsd->key_type_chosen = key_type;
-				return;
+				goto cipher_selected;
 			}
 		}
 		/* try our next cipherid */
 	}
 	bb_simple_error_msg_and_die("no common cipher suites");
+
+ cipher_selected:
+	/* Skip past cipher list */
+	p += cipher_list_len;
+	len -= cipher_list_len;
+
+	/* Skip compression methods */
+	len -= 1 + p[0];
+	p += 1 + p[0];
+
+	/* Parse extensions if present */
+	if (len < 2) {
+		dbg("No extensions");
+		return; /* no extensions */
+	}
+	extensions_len = (p[0] << 8) | p[1];
+	p += 2;
+	len -= 2;
+	dbg("Extensions total length: %u, remaining len: %d", extensions_len, len);
+
+	if (len < extensions_len) {
+		dbg("Malformed extensions length (len %d < extensions_len %u)", len, extensions_len);
+		return; /* malformed extensions, ignore */
+	}
+
+	/* Look for supported_groups extension (type 0x000a) */
+	while (extensions_len >= 4) {
+		unsigned ext_type = (p[0] << 8) | p[1];
+		int ext_len = (p[2] << 8) | p[3];
+		dbg("Extension type: 0x%04x, len: %u", ext_type, ext_len);
+		p += 4;
+		extensions_len -= 4;
+
+		if (extensions_len < ext_len) {
+			dbg("Extension length overflow");
+			return; /* malformed */
+		}
+
+		if (ext_type == 0x000a) { /* supported_groups */
+			/* Parse named curve list */
+			int curve_list_len = (p[0] << 8) | p[1];
+			dbg("Found supported_groups extension");
+			p += 2;
+			ext_len -= 2;
+			if (ext_len != curve_list_len)
+				return; /* malformed */
+			while (1) {
+				unsigned curve;
+				ext_len -= 2; /* skip (presumably existing) curve id */
+				if (ext_len < 0)
+					break; /* oops, it didn't */
+				curve = (p[0] << 8) | p[1];
+				if (curve == 0x001d) /* x25519 */
+					tls->flags |= USE_EC_CURVE_X25519;
+//				if (curve == 0x0017) /* secp256r1 (P256) */
+//					/* We'll try P256 as fallback without checking client support */
+				p += 2;
+			}
+			dbg("Client supports:%s",
+				(tls->flags & USE_EC_CURVE_X25519) ? " x25519" : " P256(assumed)");
+			return; /* found what we need */
+		}
+
+		p += ext_len;
+		extensions_len -= ext_len;
+	}
 }
 
 static void send_server_hello(tls_state_t *tls)
@@ -2580,6 +2638,67 @@ static void send_server_certificate(tls_state_t *tls)
 	xwrite_and_update_handshake_hash(tls, sz);
 }
 
+static void send_server_key_exchange(tls_state_t *tls)
+{
+	struct server_key_exchange {
+		uint8_t type;
+		uint8_t len24_hi, len24_mid, len24_lo;
+		uint8_t curve_type; /* 3 = named curve */
+		uint8_t curve_id_hi, curve_id_lo;
+		uint8_t pubkey_len;
+		uint8_t pubkey[1 + 2 * 32]; /* for P256: 04 + x(32) + y(32) */
+	};
+	struct server_key_exchange *record;
+	int pubkey_len;
+	int total_len;
+
+	record = tls_get_zeroed_outbuf(tls, sizeof(*record));
+
+	record->type = HANDSHAKE_SERVER_KEY_EXCHANGE;
+	record->curve_type = 3; /* named curve */
+
+	/* Determine which curve to use based on client's supported_groups extension.
+	 * Prefer x25519 (faster) if client supports it, otherwise use P256.
+	 * If client didn't send supported_groups, default to P256 (most widely supported).
+	 */
+	if (tls->flags & USE_EC_CURVE_X25519) { /* Use x25519 */
+		//record->curve_id_hi = 0x00; /* already zero from tls_get_zeroed_outbuf() */
+		record->curve_id_lo = 0x1d; /* x25519 */
+
+		/* Generate ephemeral keypair directly into output buffer */
+		curve_x25519_generate_keypair(tls->hsd->ecc_priv_key32, record->pubkey);
+
+		pubkey_len = 32;
+		dbg("Using x25519 for ECDHE");
+	} else { /* Use P256 (default or if client advertised it) */
+		//record->curve_id_hi = 0x00; /* already zero from tls_get_zeroed_outbuf() */
+		record->curve_id_lo = 0x17; /* secp256r1 (P256) */
+
+		/* Generate ephemeral keypair directly into output buffer */
+		record->pubkey[0] = 0x04; /* uncompressed point */
+		curve_P256_generate_keypair(tls->hsd->ecc_priv_key32, record->pubkey + 1);
+
+		pubkey_len = 1 + 2 * 32;
+		/* P256 is the default, no need to set USE_EC_CURVE_X25519 flag */
+		dbg("Using P256 for ECDHE");
+	}
+
+	record->pubkey_len = pubkey_len;
+
+	/* Calculate total length: curve_type(1) + curve_id(2) + pubkey_len(1) + pubkey */
+	total_len = 4 + pubkey_len;
+
+	//record->len24_hi = 0; /* already zero from tls_get_zeroed_outbuf() */
+	record->len24_mid = total_len >> 8;
+	record->len24_lo = total_len & 0xff;
+
+	/* Total message length */
+	total_len += 4; /* type + len24 */
+
+	dbg(">> SERVER_KEY_EXCHANGE");
+	xwrite_and_update_handshake_hash(tls, total_len);
+}
+
 static void send_server_hello_done(tls_state_t *tls)
 {
 	struct server_hello_done {
@@ -2600,15 +2719,14 @@ static void get_client_key_exchange(tls_state_t *tls)
 	struct client_key_exchange {
 		uint8_t type;
 		uint8_t len24_hi, len24_mid, len24_lo;
-		uint8_t enckey_len_hi, enckey_len_lo; /* RSA encrypted premaster length */
-		/* followed by RSA encrypted premaster secret */
+		uint8_t key[1]; /* Variable length: encrypted premaster (RSA) or EC point (ECDHE) */
 	};
 	struct client_key_exchange *record;
-	uint8_t premaster[RSA_PREMASTER_SIZE];
-	int len, enckey_len;
-	uint8_t *encrypted_premaster;
+	uint8_t premaster[RSA_PREMASTER_SIZE > EC_CURVE_KEYSIZE ? RSA_PREMASTER_SIZE : EC_CURVE_KEYSIZE];
+	int len, premaster_size;
+	uint8_t *key_data;
 
-	len = tls_xread_handshake_block(tls, 64);
+	len = tls_xread_handshake_block(tls, sizeof(*record));
 	record = (void*)(tls->inbuf + RECHDR_LEN);
 
 	if (record->type != HANDSHAKE_CLIENT_KEY_EXCHANGE) {
@@ -2616,40 +2734,85 @@ static void get_client_key_exchange(tls_state_t *tls)
 	}
 	dbg("<< CLIENT_KEY_EXCHANGE");
 
-	/* Get the length of the encrypted premaster secret */
-	enckey_len = (record->enckey_len_hi << 8) | record->enckey_len_lo;
-	dbg("enckey_len:%d len:%d", enckey_len, len);
+	key_data = record->key;
 
-	if (enckey_len < 128 || enckey_len > 512) {
-		bb_simple_error_msg_and_die("bad encrypted premaster length");
-	}
+	if (!(tls->flags & NEED_EC_KEY)) {
+		/* RSA key exchange */
+		int enckey_len;
 
-	encrypted_premaster = (uint8_t*)(record + 1);
+		/* Get the length of the encrypted premaster secret */
+		enckey_len = (key_data[0] << 8) | key_data[1];
+		key_data += 2;
+		dbg("enckey_len:%d len:%d", enckey_len, len);
 
-	/* Decrypt the premaster secret using server's private RSA key */
-	{
-		int32 ret;
-		uint32 premaster_len;
-		psRsaKey_t *key = &tls->hsd->rsa_priv_key;
-
-		premaster_len = RSA_PREMASTER_SIZE;
-		ret = psRsaDecryptPriv(NULL, key,
-		                       encrypted_premaster, enckey_len,
-		                       premaster, premaster_len, NULL);
-
-		if (ret != RSA_PREMASTER_SIZE) {
-			bb_error_msg_and_die("RSA decrypt failed or wrong premaster size: %d", ret);
+		if (enckey_len < 128 || enckey_len > 512) {
+			bb_simple_error_msg_and_die("bad encrypted premaster length");
 		}
 
-		dbg("Decrypted premaster secret (%d bytes)", ret);
+		/* Decrypt the premaster secret using server's private RSA key */
+		{
+			int32 ret;
+			uint32 plen;
+			psRsaKey_t *key = &tls->hsd->rsa_priv_key;
 
-		/* Verify premaster format: should start with version 0x03 0x03 (TLS 1.2) */
-		if (premaster[0] != 0x03 || premaster[1] != 0x03) {
-			bb_simple_error_msg_and_die("bad premaster secret version");
+			plen = RSA_PREMASTER_SIZE;
+			ret = psRsaDecryptPriv(NULL, key,
+			                       key_data, enckey_len,
+			                       premaster, plen, NULL);
+
+			if (ret != RSA_PREMASTER_SIZE) {
+				bb_error_msg_and_die("RSA decrypt failed or wrong premaster size: %d", ret);
+			}
+
+			dbg("Decrypted premaster secret (%d bytes)", ret);
+
+			/* Verify premaster format: should start with version 0x03 0x03 (TLS 1.2) */
+			if (premaster[0] != 0x03 || premaster[1] != 0x03) {
+				bb_simple_error_msg_and_die("bad premaster secret version");
+			}
 		}
+		premaster_size = RSA_PREMASTER_SIZE;
+	} else {
+		/* ECDHE key exchange */
+		int pubkey_len;
+		uint8_t *client_pubkey;
+
+		/* Get client's ephemeral public key length */
+		pubkey_len = *key_data++;
+		client_pubkey = key_data;
+
+		dbg("ECDHE: client pubkey_len:%d", pubkey_len);
+
+		/* Compute shared secret using client's public key and our private key */
+		if (tls->flags & USE_EC_CURVE_X25519) {
+			/* x25519 */
+			if (pubkey_len != CURVE25519_KEYSIZE) {
+				bb_simple_error_msg_and_die("bad x25519 public key length");
+			}
+			curve_x25519_compute_premaster(
+				tls->hsd->ecc_priv_key32, client_pubkey,
+				premaster
+			);
+			premaster_size = CURVE25519_KEYSIZE;
+		} else {
+			/* P256 */
+			if (pubkey_len != 1 + 2 * P256_KEYSIZE) {
+				bb_simple_error_msg_and_die("bad P256 public key length");
+			}
+			if (*client_pubkey++ != 0x04) {
+				bb_simple_error_msg_and_die("compressed EC points not supported");
+			}
+			curve_P256_compute_premaster(
+				tls->hsd->ecc_priv_key32, client_pubkey,
+				premaster
+			);
+			premaster_size = P256_KEYSIZE;
+		}
+
+		dbg("Computed ECDHE premaster secret (%d bytes)", premaster_size);
 	}
 
-	derive_master_secret_and_keys(tls, premaster, RSA_PREMASTER_SIZE);
+	derive_master_secret_and_keys(tls, premaster, premaster_size);
 
 	/* Server decrypts with client_write_key, encrypts with server_write_key */
 	aes_setkey(&tls->aes_decrypt, tls->client_write_key, tls->key_size);
@@ -2932,9 +3095,8 @@ void FAST_FUNC tls_handshake_as_server(tls_state_t *tls,
 	load_pem_key_cert_pairs(tls, pem_filename);
 
 	sha256_begin(&tls->hsd->handshake_hash_ctx);
-	tls->expecting_first_packet = 1;
 
-	/* Server handshake sequence (RSA mode):
+	/* Server handshake sequence:
 	 * 1. Receive ClientHello
 	 * 2. Send ServerHello
 	 * 3. Send Certificate
@@ -2947,9 +3109,13 @@ void FAST_FUNC tls_handshake_as_server(tls_state_t *tls,
 	 * 10. Send ChangeCipherSpec
 	 * 11. Send Finished (encrypted)
 	 */
+	tls->expecting_first_packet = 1;
 	get_client_hello(tls);
+	tls->expecting_first_packet = 0;
 	send_server_hello(tls);
 	send_server_certificate(tls);
+	if (tls->flags & NEED_EC_KEY)
+		send_server_key_exchange(tls);
 	send_server_hello_done(tls);
 
 	get_client_key_exchange(tls);

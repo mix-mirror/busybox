@@ -108,6 +108,22 @@ void tls_get_random(void *buf, unsigned len) FAST_FUNC;
 #define P256_KEYSIZE       32
 #define CURVE25519_KEYSIZE 32
 
+/* Separate keypair generation and premaster computation functions */
+void curve_x25519_generate_keypair(
+		uint8_t *privkey32, uint8_t *pubkey32) FAST_FUNC;
+void curve_x25519_compute_premaster(
+		const uint8_t *privkey32, const uint8_t *peerkey32,
+		uint8_t *premaster32) FAST_FUNC;
+
+#if ENABLE_SSL_SERVER
+void curve_P256_generate_keypair(
+		uint8_t *privkey32, uint8_t *pubkey2x32) FAST_FUNC;
+void curve_P256_compute_premaster(
+		const uint8_t *privkey32, const uint8_t *peerkey2x32,
+		uint8_t *premaster32) FAST_FUNC;
+#endif
+
+/* Combined operations (for client-side use) */
 void curve_x25519_compute_pubkey_and_premaster(
 		uint8_t *pubkey32, uint8_t *premaster32,
 		const uint8_t *peerkey32) FAST_FUNC;
