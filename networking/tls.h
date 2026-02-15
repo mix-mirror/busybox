@@ -48,6 +48,7 @@
 #define PS_PLATFORM_FAIL        -7      /* Failure as a result of system call error */
 #define PS_MEM_FAIL             -8      /* Failure to allocate requested memory */
 #define PS_LIMIT_FAIL           -9      /* Failure on sanity/limit tests */
+#define PS_UNSUPPORTED_FAIL     -10     /* Unsupported algorithm or operation */
 
 #define PS_TRUE         1
 #define PS_FALSE        0
@@ -89,6 +90,7 @@ void tls_get_random(void *buf, unsigned len) FAST_FUNC;
 
 #define matrixCryptoGetPrngData(buf, len, userPtr) (tls_get_random(buf, len), PS_SUCCESS)
 
+#define psMalloc(pool, size) xmalloc(size)
 #define psFree(p, pool)    free(p)
 #define psTraceCrypto(msg) bb_simple_error_msg_and_die(msg)
 

@@ -318,6 +318,7 @@ enum {
 	ENCRYPTION_AESGCM      = 1 << 5, // else AES-SHA (or NULL-SHA if ALLOW_RSA_NULL_SHA256=1)
 };
 
+#if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
 /* Note: return value matches KEY_RSA (0) / KEY_ECDSA (1) enum values */
 static int is_cipher_ECDSA(const uint8_t *cipherid)
 {
@@ -330,6 +331,7 @@ static int is_cipher_ECDSA(const uint8_t *cipherid)
 		|| cipher_lo == 0x23 || cipher_lo == 0x2B
 	);
 }
+#endif
 
 /* Set cipher parameters based on selected cipher_id */
 static void set_cipher_parameters(tls_state_t *tls, const uint8_t *cipherid)
@@ -406,6 +408,7 @@ struct tls_handshake_data {
 	//uint8_t saved_client_hello[1];
 
 #if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
+	smallint reneg_info_requested;
 	/* Server certificate and key data */
 	char *keys[2];
 	char *certs[2];
@@ -428,18 +431,20 @@ static unsigned get24be(const uint8_t *p)
 	return 0x100*(0x100*p[0] + p[1]) + p[2];
 }
 
+#if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
 static int is_minor_version_valid(tls_state_t *tls, uint8_t minor_ver)
 {
-#if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
 	if (tls->expecting_first_packet == 1) {
 		/* First packet: accept TLS 1.0 (3.1) through TLS 1.3 (3.4)
 		 * for compatibility with clients using other record versions */
 		return (minor_ver > 0 && minor_ver <= 4);
 	}
 	/* Subsequent packets: must match negotiated version exactly */
-#endif
 	return minor_ver == TLS_MIN;
 }
+#else
+#define is_minor_version_valid(tls, minor_ver) ((minor_ver) == TLS_MIN)
+#endif
 
 #if TLS_DEBUG
 /* Nondestructively see the current hash value */
@@ -711,7 +716,7 @@ static void xwrite_encrypted_and_hmac_signed(tls_state_t *tls, unsigned size, un
 
 	/* Calculate MAC signature */
 	hmac_blocks(tls, buf + size, /* result */
-		tls->client_write_MAC_key, TLS_MAC_SIZE(tls),
+		tls->our_write_MAC_key, TLS_MAC_SIZE(tls),
 		&tls->write_seq64_be, sizeof(tls->write_seq64_be),
 		xhdr, RECHDR_LEN,
 		buf, size,
@@ -883,7 +888,7 @@ static void xwrite_encrypted_aesgcm(tls_state_t *tls, unsigned size, unsigned ty
 	/* set aad[12], and clear aad[13..15] */
 	COUNTER(aad) = SWAP_LE32(size & 0xff);
 
-	memcpy(nonce, tls->client_write_IV, 4);
+	memcpy(nonce, tls->our_write_IV, 4);
 	t64 = tls->write_seq64_be;
 	move_to_unaligned64(nonce + 4, t64);
 	move_to_unaligned64(aad,       t64);
@@ -1046,7 +1051,7 @@ static void tls_aesgcm_decrypt(tls_state_t *tls, uint8_t *buf, int size)
 	///* set aad[12], and clear aad[13..15] */
 	//COUNTER(aad) = SWAP_LE32(size & 0xff);
 
-	memcpy(nonce,     tls->server_write_IV, 4);
+	memcpy(nonce,     tls->peer_write_IV, 4);
 	memcpy(nonce + 4, buf, 8);
 
 	cnt = 1;
@@ -1930,30 +1935,22 @@ static void derive_master_secret_and_keys(tls_state_t *tls, uint8_t *premaster, 
 	memcpy(&tmp64[32], &tls->hsd->client_and_server_rand32[0] , 32);
 
 	prf_hmac_sha256(/*tls,*/
-		tls->client_write_MAC_key, 2 * (tls->MAC_size + tls->key_size + tls->IV_size),
-		// also fills:
-		// server_write_MAC_key[]
-		// client_write_key[]
-		// server_write_key[]
-		// client_write_IV[]
-		// server_write_IV[]
+		tls->key_block, 2 * (tls->MAC_size + tls->key_size + tls->IV_size),
 		tls->hsd->master_secret, sizeof(tls->hsd->master_secret),
 		"key expansion",
 		tmp64, 64
 	);
-	tls->client_write_key = tls->client_write_MAC_key + (2 * tls->MAC_size);
-	tls->server_write_key = tls->client_write_key + tls->key_size;
-	tls->client_write_IV = tls->server_write_key + tls->key_size;
-	tls->server_write_IV = tls->client_write_IV + tls->IV_size;
-	dump_hex("client_write_MAC_key:%s",
-		tls->client_write_MAC_key, tls->MAC_size
-	);
-	dump_hex("client_write_key:%s",
-		tls->client_write_key, tls->key_size
-	);
-	dump_hex("client_write_IV:%s",
-		tls->client_write_IV, tls->IV_size
-	);
+}
+
+static void initialize_aes_keys(tls_state_t *tls)
+{
+	uint8_t iv[AES_BLOCK_SIZE];
+	aes_setkey(&tls->aes_decrypt, tls->peer_write_key, tls->key_size);
+	aes_setkey(&tls->aes_encrypt, tls->our_write_key, tls->key_size);
+	if (1) { //if AESGCM
+		memset(iv, 0, AES_BLOCK_SIZE);
+		aes_encrypt_one_block(&tls->aes_encrypt, iv, tls->H);
+	}
 }
 
 static void send_client_key_exchange(tls_state_t *tls)
@@ -2038,14 +2035,21 @@ static void send_client_key_exchange(tls_state_t *tls)
 	xwrite_and_update_handshake_hash(tls, len);
 
 	derive_master_secret_and_keys(tls, premaster, premaster_size);
+	// The key_block is partitioned as follows:
+	tls->our_write_MAC_key  = tls->key_block;                          // client_write_MAC_key[]
+	tls->peer_write_MAC_key = tls->key_block          + tls->MAC_size; // server_write_MAC_key[]
+	tls->our_write_key      = tls->peer_write_MAC_key + tls->MAC_size; // client_write_key[]
+	tls->peer_write_key     = tls->our_write_key      + tls->key_size; // server_write_key[]
+	tls->our_write_IV       = tls->peer_write_key     + tls->key_size; // client_write_IV[]
+	tls->peer_write_IV      = tls->our_write_IV       + tls->IV_size;  // server_write_IV[]
+	dump_hex("client write_MAC_key:%s", tls->our_write_MAC_key, tls->MAC_size);
+	dump_hex("client write_key:%s",	tls->our_write_key, tls->key_size);
+	dump_hex("client write_IV:%s", tls->our_write_IV, tls->IV_size);
+	dump_hex("server write_MAC_key:%s", tls->peer_write_MAC_key, tls->MAC_size);
+	dump_hex("server write_key:%s",	tls->peer_write_key, tls->key_size);
+	dump_hex("server write_IV:%s", tls->peer_write_IV, tls->IV_size);
 
-	aes_setkey(&tls->aes_decrypt, tls->server_write_key, tls->key_size);
-	aes_setkey(&tls->aes_encrypt, tls->client_write_key, tls->key_size);
-	{
-		uint8_t iv[AES_BLOCK_SIZE];
-		memset(iv, 0, AES_BLOCK_SIZE);
-		aes_encrypt_one_block(&tls->aes_encrypt, iv, tls->H);
-	}
+	initialize_aes_keys(tls);
 }
 
 static const uint8_t rec_CHANGE_CIPHER_SPEC[] ALIGN1 = {
@@ -2118,8 +2122,8 @@ static void send_finished(tls_state_t *tls, const char *msg_to_encrypt)
 		handshake_hash, len
 	);
 	dump_hex("from secret: %s", tls->hsd->master_secret, sizeof(tls->hsd->master_secret));
-	dump_hex("from labelSeed: %s", "client finished", sizeof("client finished")-1);
-	dump_hex("%s", handshake_hash, sizeof(handshake_hash));
+	dump_hex("from labelSeed: %s", msg_to_encrypt, strlen(msg_to_encrypt));
+	dump_hex("handshake_hash: %s", handshake_hash, sizeof(handshake_hash));
 	dump_hex("=> digest: %s", record->prf_result, sizeof(record->prf_result));
 
 	dbg(">> FINISHED");
@@ -2440,7 +2444,7 @@ static void get_client_hello(tls_state_t *tls)
 	/* NB: the recv'd block is already hashed by tls_xread_handshake_block() */
 	hp = (void*)(tls->inbuf + RECHDR_LEN);
 	if (hp->type != HANDSHAKE_CLIENT_HELLO
-	 || hp->len24_hi  != 0
+	 || hp->len24_hi != 0
 	 || len != ((hp->len24_mid << 8) | hp->len24_lo) + 4
 	 || hp->proto_maj != TLS_MAJ
 	 || !is_minor_version_valid(tls, hp->proto_min)
@@ -2452,18 +2456,11 @@ static void get_client_hello(tls_state_t *tls)
 	/* Save client random */
 	memcpy(tls->hsd->client_and_server_rand32, hp->rand32, 32);
 
-	/* Parse cipher suites to select one we support */
-	p = (uint8_t*)(hp + 1);
-
 	/* Skip session ID and handshake header */
-	len -= sizeof(*hp);
-	p += hp->session_id_len;
-	len -= hp->session_id_len;
-	if (len < 0) {
-		bb_simple_error_msg_and_die("malformed ClientHello");
-	}
+	p = (uint8_t*)(hp + 1) + hp->session_id_len;
+	len -= (sizeof(*hp) + hp->session_id_len);
 
-	/* Parse cipher suite list */
+	/* Parse cipher suites to select one we support */
 	if (len < 2) {
 		bb_simple_error_msg_and_die("malformed ClientHello");
 	}
@@ -2473,6 +2470,17 @@ static void get_client_hello(tls_state_t *tls)
 
 	if (len < cipher_list_len) {
 		bb_simple_error_msg_and_die("malformed ClientHello");
+	}
+
+	/* Check whether we have TLS_EMPTY_RENEGOTIATION_INFO_SCSV */
+	for (j = 0; j < cipher_list_len; j += 2) {
+		if (p[j] == TLS_EMPTY_RENEGOTIATION_INFO_SCSV >> 8
+		 && p[j + 1] == (uint8_t)TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+		) {
+			dbg("got TLS_EMPTY_RENEGOTIATION_INFO_SCSV");
+			tls->hsd->reneg_info_requested = 1;
+			break;
+		}
 	}
 
 	/* Select cipher + cert pair from client's list, preferring our ciphers in order */
@@ -2533,15 +2541,15 @@ static void get_client_hello(tls_state_t *tls)
 		return; /* malformed extensions, ignore */
 	}
 
-	/* Look for supported_groups extension (type 0x000a) */
+	/* Process extensions */
 	while (extensions_len >= 4) {
 		unsigned ext_type = (p[0] << 8) | p[1];
 		int ext_len = (p[2] << 8) | p[3];
 		dbg("Extension type: 0x%04x, len: %u", ext_type, ext_len);
-		p += 4;
-		extensions_len -= 4;
 
-		if (extensions_len < ext_len) {
+		p += 4;
+		extensions_len -= 4 + ext_len;
+		if (extensions_len < 0) {
 			dbg("Extension length overflow");
 			return; /* malformed */
 		}
@@ -2552,7 +2560,7 @@ static void get_client_hello(tls_state_t *tls)
 			dbg("Found supported_groups extension");
 			p += 2;
 			ext_len -= 2;
-			if (ext_len != curve_list_len)
+			if (ext_len != curve_list_len || (ext_len & 1))
 				return; /* malformed */
 			while (1) {
 				unsigned curve;
@@ -2560,19 +2568,22 @@ static void get_client_hello(tls_state_t *tls)
 				if (ext_len < 0)
 					break; /* oops, it didn't */
 				curve = (p[0] << 8) | p[1];
+				p += 2;
 				if (curve == 0x001d) /* x25519 */
 					tls->flags |= USE_EC_CURVE_X25519;
 //				if (curve == 0x0017) /* secp256r1 (P256) */
 //					/* We'll try P256 as fallback without checking client support */
-				p += 2;
 			}
 			dbg("Client supports:%s",
 				(tls->flags & USE_EC_CURVE_X25519) ? " x25519" : " P256(assumed)");
-			return; /* found what we need */
+			continue;
 		}
 
+		if (ext_type == 0xff01) {
+			dbg("got reneg_info extension ff01");
+			tls->hsd->reneg_info_requested = 1;
+		}
 		p += ext_len;
-		extensions_len -= ext_len;
 	}
 }
 
@@ -2591,8 +2602,12 @@ static void send_server_hello(tls_state_t *tls)
 		uint8_t ext_reneg_info[5];  /* ff 01 00 01 00 */
 	};
 	struct server_hello *record;
+	unsigned len = sizeof(*record);
 
-	record = get_outbuf_fill_handshake_record(tls, HANDSHAKE_SERVER_HELLO, sizeof(*record));
+	if (!tls->hsd->reneg_info_requested)
+		len -= 7;
+
+	record = get_outbuf_fill_handshake_record(tls, HANDSHAKE_SERVER_HELLO, len);
 
 	record->proto_maj = TLS_MAJ;
 	record->proto_min = TLS_MIN;
@@ -2611,19 +2626,21 @@ static void send_server_hello(tls_state_t *tls)
 	/* No compression */
 	//record->comprtype = 0;
 
-	/* Extensions */
-	//record->extensions_len_hi = 0;
-	record->extensions_len_lo = 5; /* length of renegotiation_info extension */
+	if (tls->hsd->reneg_info_requested) {
+		/* Extensions */
+		//record->extensions_len_hi = 0;
+		record->extensions_len_lo = 5; /* length of renegotiation_info extension */
 
-	/* Renegotiation info extension (RFC 5746) */
-	record->ext_reneg_info[0] = 0xff;
-	record->ext_reneg_info[1] = 0x01; /* extension type */
-	//record->ext_reneg_info[2] = 0x00;
-	record->ext_reneg_info[3] = 0x01; /* extension data length: 1 byte */
-	//record->ext_reneg_info[4] = 0x00; /* renegotiation info length: 0 (no previous connection) */
+		/* Renegotiation info extension (RFC 5746) */
+		record->ext_reneg_info[0] = 0xff;
+		record->ext_reneg_info[1] = 0x01; /* extension type */
+		//record->ext_reneg_info[2] = 0x00;
+		record->ext_reneg_info[3] = 0x01; /* extension data length: 1 byte */
+		//record->ext_reneg_info[4] = 0x00; /* renegotiation info length: 0 (no previous connection) */
+	}
 
 	dbg(">> SERVER_HELLO");
-	xwrite_and_update_handshake_hash(tls, sizeof(*record));
+	xwrite_and_update_handshake_hash(tls, len);
 }
 
 static void send_server_certificate(tls_state_t *tls)
@@ -2647,12 +2664,18 @@ static void send_server_key_exchange(tls_state_t *tls)
 		uint8_t curve_id_hi, curve_id_lo;
 		uint8_t pubkey_len;
 		uint8_t pubkey[1 + 2 * 32]; /* for P256: 04 + x(32) + y(32) */
+		/* Followed by signature: hash_alg(1) + sign_alg(1) + sig_len(2) + signature */
 	};
 	struct server_key_exchange *record;
+	uint8_t *p;
 	int pubkey_len;
+	int params_len;
 	int total_len;
+	uint8_t hash[32]; /* SHA256 hash */
+	sha256_ctx_t sha256_ctx;
+	int32 sig_len;
 
-	record = tls_get_zeroed_outbuf(tls, sizeof(*record));
+	record = tls_get_zeroed_outbuf(tls, sizeof(*record) + 4 + 512); /* extra space for signature */
 
 	record->type = HANDSHAKE_SERVER_KEY_EXCHANGE;
 	record->curve_type = 3; /* named curve */
@@ -2685,14 +2708,43 @@ static void send_server_key_exchange(tls_state_t *tls)
 
 	record->pubkey_len = pubkey_len;
 
-	/* Calculate total length: curve_type(1) + curve_id(2) + pubkey_len(1) + pubkey */
-	total_len = 4 + pubkey_len;
+	/* ServerECDHParams length: curve_type(1) + curve_id(2) + pubkey_len(1) + pubkey */
+	params_len = 4 + pubkey_len;
+
+	/* Sign the parameters with our RSA private key:
+	 * Signature is over SHA256(client_random + server_random + ServerECDHParams)
+	 */
+	sha256_begin(&sha256_ctx);
+	sha256_hash(&sha256_ctx, tls->hsd->client_and_server_rand32, 2 * 32);
+	sha256_hash(&sha256_ctx, &record->curve_type, params_len);
+	sha256_end(&sha256_ctx, hash);
+
+	/* Pointer to where signature data goes (after ServerECDHParams) */
+	p = record->pubkey + pubkey_len;
+
+	/* SignatureAndHashAlgorithm: hash=SHA256(4), signature=RSA(1) */
+	*p++ = 4; /* SHA256 */
+	*p++ = 1; /* RSA */
+
+	/* Sign the hash */
+	sig_len = privRsaEncryptSignedElement(NULL, &tls->hsd->rsa_priv_key,
+		hash, 32, p + 2, 512, NULL);
+	if (sig_len < 0) {
+		bb_error_msg_and_die("RSA signature failed");
+	}
+
+	/* Signature length (2 bytes, big-endian) */
+	p[0] = sig_len >> 8;
+	p[1] = sig_len & 0xff;
+
+	/* Total handshake message length: params + hash_alg(1) + sign_alg(1) + sig_len(2) + signature */
+	total_len = params_len + 2 + 2 + sig_len;
 
 	//record->len24_hi = 0; /* already zero from tls_get_zeroed_outbuf() */
 	record->len24_mid = total_len >> 8;
 	record->len24_lo = total_len & 0xff;
 
-	/* Total message length */
+	/* Total wire length */
 	total_len += 4; /* type + len24 */
 
 	dbg(">> SERVER_KEY_EXCHANGE");
@@ -2813,16 +2865,21 @@ static void get_client_key_exchange(tls_state_t *tls)
 	}
 
 	derive_master_secret_and_keys(tls, premaster, premaster_size);
+	// The key_block[] is partitioned as follows:
+	tls->peer_write_MAC_key = tls->key_block;                         // client_write_MAC_key[]
+	tls->our_write_MAC_key  = tls->key_block         + tls->MAC_size; // server_write_MAC_key[]
+	tls->peer_write_key     = tls->our_write_MAC_key + tls->MAC_size; // client_write_key[]
+	tls->our_write_key      = tls->peer_write_key    + tls->key_size; // server_write_key[]
+	tls->peer_write_IV      = tls->our_write_key     + tls->key_size; // client_write_IV[]
+	tls->our_write_IV       = tls->peer_write_IV     + tls->IV_size;  // server_write_IV[]
+	dump_hex("server write_MAC_key:%s", tls->our_write_MAC_key, tls->MAC_size);
+	dump_hex("server write_key:%s",	tls->our_write_key, tls->key_size);
+	dump_hex("server write_IV:%s", tls->our_write_IV, tls->IV_size);
+	dump_hex("client write_MAC_key:%s", tls->peer_write_MAC_key, tls->MAC_size);
+	dump_hex("client write_key:%s",	tls->peer_write_key, tls->key_size);
+	dump_hex("client write_IV:%s", tls->peer_write_IV, tls->IV_size);
 
-	/* Server decrypts with client_write_key, encrypts with server_write_key */
-	aes_setkey(&tls->aes_decrypt, tls->client_write_key, tls->key_size);
-	aes_setkey(&tls->aes_encrypt, tls->server_write_key, tls->key_size);
-	{
-		uint8_t iv[AES_BLOCK_SIZE];
-		memset(iv, 0, AES_BLOCK_SIZE);
-		aes_encrypt_one_block(&tls->aes_encrypt, iv, tls->H);
-	}
-	dbg("Derived key block");
+	initialize_aes_keys(tls);
 }
 
 /* Load RSA private key from DER file (supports PKCS#8 or PKCS#1)

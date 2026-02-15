@@ -899,17 +899,18 @@ typedef struct tls_state {
 	/*uint64_t read_seq64_be;*/
 	uint64_t write_seq64_be;
 
-	/*uint8_t *server_write_MAC_key;*/
-	uint8_t *client_write_key;
-	uint8_t *server_write_key;
-	uint8_t *client_write_IV;
-	uint8_t *server_write_IV;
-	uint8_t client_write_MAC_key[TLS_MAX_MAC_SIZE];
-	uint8_t server_write_MAC_k__[TLS_MAX_MAC_SIZE];
-	uint8_t client_write_k__[TLS_MAX_KEY_SIZE];
-	uint8_t server_write_k__[TLS_MAX_KEY_SIZE];
-	uint8_t client_write_I_[TLS_MAX_IV_SIZE];
-	uint8_t server_write_I_[TLS_MAX_IV_SIZE];
+	uint8_t *our_write_MAC_key;
+	uint8_t *peer_write_MAC_key;
+	uint8_t *our_write_key;
+	uint8_t *peer_write_key;
+	uint8_t *our_write_IV;
+	uint8_t *peer_write_IV;
+	uint8_t key_block[TLS_MAX_MAC_SIZE];
+	uint8_t key_block2[TLS_MAX_MAC_SIZE];
+	uint8_t key_block3[TLS_MAX_KEY_SIZE];
+	uint8_t key_block4[TLS_MAX_KEY_SIZE];
+	uint8_t key_block5[TLS_MAX_IV_SIZE];
+	uint8_t key_block6[TLS_MAX_IV_SIZE];
 
 	struct tls_aes aes_encrypt;
 	struct tls_aes aes_decrypt;
