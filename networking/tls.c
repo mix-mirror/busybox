@@ -712,7 +712,7 @@ static void xwrite_encrypted_and_hmac_signed(tls_state_t *tls, unsigned size, un
 	xhdr->proto_min = TLS_MIN;
 	/* fake unencrypted record len for MAC calculation */
 	xhdr->len16_hi = size >> 8;
-	xhdr->len16_lo = size & 0xff;
+	xhdr->len16_lo = size; // & 0xff implicit
 
 	/* Calculate MAC signature */
 	hmac_blocks(tls, buf + size, /* result */
@@ -764,7 +764,7 @@ static void xwrite_encrypted_and_hmac_signed(tls_state_t *tls, unsigned size, un
 	) {
 		/* No encryption, only signing */
 		xhdr->len16_hi = size >> 8;
-		xhdr->len16_lo = size & 0xff;
+		xhdr->len16_lo = size; // & 0xff implicit
 		dump_raw_out(">> %s", xhdr, RECHDR_LEN + size);
 		xwrite(tls->ofd, xhdr, RECHDR_LEN + size);
 		dbg("wrote %u bytes (NULL crypt, SHA256 hash)", size);
@@ -845,7 +845,7 @@ static void xwrite_encrypted_and_hmac_signed(tls_state_t *tls, unsigned size, un
 			AES_BLOCK_SIZE, size, padding_length);
 	size += AES_BLOCK_SIZE;     /* + IV */
 	xhdr->len16_hi = size >> 8;
-	xhdr->len16_lo = size & 0xff;
+	xhdr->len16_lo = size; // & 0xff implicit
 	dump_raw_out(">> %s", xhdr, RECHDR_LEN + size);
 	xwrite(tls->ofd, xhdr, RECHDR_LEN + size);
 	dbg("wrote %u bytes", (int)RECHDR_LEN + size);
@@ -929,7 +929,7 @@ static void xwrite_encrypted_aesgcm(tls_state_t *tls, unsigned size, unsigned ty
 	xhdr->proto_maj = TLS_MAJ;
 	xhdr->proto_min = TLS_MIN;
 	xhdr->len16_hi = size >> 8;
-	xhdr->len16_lo = size & 0xff;
+	xhdr->len16_lo = size; // & 0xff implicit
 	size += RECHDR_LEN;
 	dump_raw_out(">> %s", xhdr, size);
 	xwrite(tls->ofd, xhdr, size);
@@ -955,7 +955,7 @@ static void xwrite_handshake_record(tls_state_t *tls, unsigned size)
 	xhdr->proto_maj = TLS_MAJ;
 	xhdr->proto_min = TLS_MIN;
 	xhdr->len16_hi = size >> 8;
-	xhdr->len16_lo = size & 0xff;
+	xhdr->len16_lo = size; // & 0xff implicit
 	dump_raw_out(">> %s", xhdr, RECHDR_LEN + size);
 	xwrite(tls->ofd, xhdr, RECHDR_LEN + size);
 	dbg("wrote %u bytes", (int)RECHDR_LEN + size);
@@ -1536,7 +1536,7 @@ static ALWAYS_INLINE void fill_handshake_record_hdr(void *buf, unsigned type, un
 	h->type = type;
 	h->len24_hi  = len >> 16;
 	h->len24_mid = len >> 8;
-	h->len24_lo  = len & 0xff;
+	h->len24_lo  = len; // & 0xff implicit
 }
 
 static void *get_outbuf_fill_handshake_record(tls_state_t *tls, unsigned type, unsigned len)
@@ -1991,7 +1991,7 @@ static void send_client_key_exchange(tls_state_t *tls)
 		);
 		/* keylen16 exists for RSA (in TLS, not in SSL), but not for some other key types */
 		record->key[0] = len >> 8;
-		record->key[1] = len & 0xff;
+		record->key[1] = len; // & 0xff implicit
 		len += 2;
 		premaster_size = RSA_PREMASTER_SIZE;
 	} else {
@@ -2028,7 +2028,7 @@ static void send_client_key_exchange(tls_state_t *tls)
 	record->type = HANDSHAKE_CLIENT_KEY_EXCHANGE;
 	/* record->len24_hi = 0; - already is */
 	record->len24_mid = len >> 8;
-	record->len24_lo  = len & 0xff;
+	record->len24_lo  = len;
 	len += 4;
 
 	dbg(">> CLIENT_KEY_EXCHANGE");
@@ -2444,14 +2444,13 @@ static void get_client_hello(tls_state_t *tls)
 	/* NB: the recv'd block is already hashed by tls_xread_handshake_block() */
 	hp = (void*)(tls->inbuf + RECHDR_LEN);
 	if (hp->type != HANDSHAKE_CLIENT_HELLO
-	 || hp->len24_hi != 0
-	 || len != ((hp->len24_mid << 8) | hp->len24_lo) + 4
+	 || len != get24be(&hp->len24_hi) + 4
 	 || hp->proto_maj != TLS_MAJ
 	 || !is_minor_version_valid(tls, hp->proto_min)
 	) {
 		bad_record_die(tls, "'client hello'", len);
 	}
-	dbg("<< CLIENT_HELLO len:%d len24:%d", len, (hp->len24_mid << 8) | hp->len24_lo);
+	dbg("<< CLIENT_HELLO len:%d len24:%d", len, get24be(&len24_hi));
 
 	/* Save client random */
 	memcpy(tls->hsd->client_and_server_rand32, hp->rand32, 32);
@@ -2621,7 +2620,7 @@ static void send_server_hello(tls_state_t *tls)
 
 	/* Selected cipher suite */
 	record->cipherid_hi = tls->cipher_id >> 8;
-	record->cipherid_lo = tls->cipher_id; /* & 0xff implicit */
+	record->cipherid_lo = tls->cipher_id; // & 0xff implicit
 
 	/* No compression */
 	//record->comprtype = 0;
@@ -2735,14 +2734,14 @@ static void send_server_key_exchange(tls_state_t *tls)
 
 	/* Signature length (2 bytes, big-endian) */
 	p[0] = sig_len >> 8;
-	p[1] = sig_len & 0xff;
+	p[1] = sig_len; // & 0xff implicit
 
 	/* Total handshake message length: params + hash_alg(1) + sign_alg(1) + sig_len(2) + signature */
 	total_len = params_len + 2 + 2 + sig_len;
 
 	//record->len24_hi = 0; /* already zero from tls_get_zeroed_outbuf() */
 	record->len24_mid = total_len >> 8;
-	record->len24_lo = total_len & 0xff;
+	record->len24_lo = total_len; // & 0xff implicit
 
 	/* Total wire length */
 	total_len += 4; /* type + len24 */
