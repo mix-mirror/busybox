@@ -278,7 +278,7 @@ static void ALWAYS_INLINE remove_and_free_to_net(pty_to_net_t *ts)
 
 // Theory of operation
 // (AKA "when should I close fds? when should I detach from ioloop?").
-// The fds are named read_fs and write_fd, but for clarity let's call them netfd and ptyfd.
+// The fds are named read_fd and write_fd, but for clarity let's call them netfd and ptyfd.
 // net_to_pty::have_data_to_write
 // net_to_pty::have_buffer_to_read_into
 //  if ptyfd < 0: //sibling told us ptyfd is down?
@@ -297,6 +297,14 @@ static void ALWAYS_INLINE remove_and_free_to_net(pty_to_net_t *ts)
 //    if no sibling: close(netfd);
 //    netfd = -1; //no longer try to read
 //    return 0; //but do not detach yet
+
+static unsigned char read_byte_unescaping_IAC(unsigned char **pp)
+{
+	unsigned char c = *(*pp)++;
+	if (c == IAC && **pp == IAC)
+		(*pp)++;  /* Skip the second IAC in IAC IAC sequence */
+	return c;
+}
 
 static int net_to_pty__have_data_to_write(void *this)
 {
@@ -339,24 +347,25 @@ static int net_to_pty__have_data_to_write(void *this)
 	/* size is >= 2 and buf[0] is IAC */
 	//dbg_iac("size:%d %02x %02x", size, buf[0], buf[1]);
 
-	/* Cannot process IACs which wrap around buffer's end, need 7 contiguous chars */
-	if (ts->wridx > TO_PTY_BUFSIZE - 8) {
+	/* Cannot process IACs which wrap around buffer's end.
+	 * Worst case: IAC SB NAWS with all bytes IAC-escaped = 13 bytes */
+	while (ts->wridx > TO_PTY_BUFSIZE - 14) {
 		uint64_t v64;
 		if (ts->wridx < ts->rdidx) {
 			/* |.......WRxRD.| */
-			/* Buffer is not wrapped yet */
-		} else {
-			/* Possible situations: */
-			/* |xRD.......WRx| wrapped */
-			/* |xxxxxxxxRDWRx| wrapped and full! rdidx = wridx */
-			/* Rotate entire buffer 8 bytes back */
-			v64 = *(uint64_t*)BUF2PTY(ts);
-			memmove(BUF2PTY(ts), BUF2PTY(ts) + 8, TO_PTY_BUFSIZE - 8);
-			*(uint64_t*)(BUF2PTY(ts) + TO_PTY_BUFSIZE - 8) = v64;
-			ts->wridx -= 8; /* can't underflow */
-			buf -= 8;
-			BUF2PTY_DEC(ts->rdidx, 8); /* can underflow, use DEC() */
+			/* Buffer is not wrapped */
+			break;
 		}
+		/* Possible situations: */
+		/* |xRD.......WRx| wrapped */
+		/* |xxxxxxxxRDWRx| wrapped and full! rdidx = wridx */
+		/* Rotate entire buffer 8 bytes back */
+		v64 = *(uint64_t*)BUF2PTY(ts);
+		memmove(BUF2PTY(ts), BUF2PTY(ts) + 8, TO_PTY_BUFSIZE - 8);
+		*(uint64_t*)(BUF2PTY(ts) + TO_PTY_BUFSIZE - 8) = v64;
+		ts->wridx -= 8; /* can't underflow */
+		buf -= 8;
+		BUF2PTY_DEC(ts->rdidx, 8); /* can underflow, use DEC() */
 	}
 
 	if (buf[1] == IAC) /* IAC-IAC: we have something to write */
@@ -390,19 +399,39 @@ static int net_to_pty__have_data_to_write(void *this)
 	}
 	if (buf[1] == SB) {
 		if (buf[2] == TELOPT_NAWS) {
-			/* IAC, SB, TELOPT_NAWS, 4-byte, IAC SE */
+			/* IAC,SB,TELOPT_NAWS,<4 bytes possibly IAC-escaped>,IAC,SE */
 			struct winsize ws;
-			if (size <= 6) /* incomplete, can't process */
+			unsigned char *p;
+			unsigned char byte45, byte67, byte89;
+
+			/* The usual: IAC,SB,TELOPT_NAWS,w,w,h,h (IAC,SE later): 7 + 2 = 9 bytes
+			 * The worst: IAC,SB,TELOPT_NAWS,w,w,w,w,h,h,h,h (all w,h are IACs): 11 bytes
+			 * We can't check for size < 11:
+			 * will mishandle IAC,SB,TELOPT_NAWS,w,w,h,h,IAC,SE,'A' (10 bytes)
+			 * the write of 'A' (ordinary visible char) can be delayed!
+			 */
+			if (size < 9) /* postpone parsing until have 9+ bytes */
 				goto cant_write;
 			memset(&ws, 0, sizeof(ws)); /* pixel sizes are set to 0 */
-			ws.ws_col = (buf[3] << 8) | buf[4];
-			ws.ws_row = (buf[5] << 8) | buf[6];
-//TODO: sanity check: are they nonzero?
+			p = buf + 3;
+			byte45 = read_byte_unescaping_IAC(&p);
+			byte67 = read_byte_unescaping_IAC(&p);
+			byte89 = read_byte_unescaping_IAC(&p); /* fetches _at most_ byte#9 - allowed by size */
+			/* If any one of these is IAC, the NAWS seq must be at least 10 bytes.
+			 * IOW: it can't be case 'A' above. *Can* postpone if size == 10!
+			 */
+			if (byte45 == 0xff || byte67 == 0xff || byte89 == 0xff)
+				if (size < 11) /* postpone parsing until have 11+ bytes */
+					goto cant_write;
+			ws.ws_col = (byte45 << 8) | byte67;
+			ws.ws_row = (byte89 << 8) | read_byte_unescaping_IAC(&p); /* fetches _at most_ byte#11 */
+
+			if (ws.ws_col != 0 && ws.ws_row != 0) /* don't provoke bugs elsewhere with "zero-sized screen" */
+				ioctl(ts->write_fd, TIOCSWINSZ, (char *)&ws);
 			log1("pfd:%d window size:%dx%d", ts->write_fd, ws.ws_row, ws.ws_col);
-			ioctl(ts->write_fd, TIOCSWINSZ, (char *)&ws);
-			increment = 7;
+			increment = p - buf;
 			goto inc;
-			/* trailing IAC SE will be eaten separately, as 2-byte NOP */
+			/* trailing IAC,SE will be eaten separately, as 2-byte NOP */
 		}
 //fixme: skip them correctly
 		/* else: other subnegs not supported yet */
