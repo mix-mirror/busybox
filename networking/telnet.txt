@@ -2,7 +2,7 @@
 // IAC SE (240) End of subnegotiation parameters
 // IAC NOP (241) No operation
 // IAC DM (242) Data Mark (used with TCP urgent pointer)
-// IAC BRK (243) Break (simulate serial line break) - perhaps tcsendbreak(master_ptyfd, 0) [untested]?
+// IAC BRK (243) Break (simulate serial line break) - perhaps tcsendbreak(master_ptyfd)? [untested]
 // IAC IP (244) Interrupt Process ("send SIGINT to foreground process group a-la ^C")
 // IAC AO (245) Abort Output
 // IAC AYT (246) Are You There

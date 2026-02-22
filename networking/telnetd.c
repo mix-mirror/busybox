@@ -866,13 +866,21 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 	 * stuff that requires char-by-char support. */
 	{
 		static const char iacs_to_send[] ALIGN1 = {
-			IAC, DO, TELOPT_ECHO,
-			IAC, DO, TELOPT_NAWS,
-			/* This requires telnetd.ctrlSQ.patch (incomplete) */
-			/*IAC, DO, TELOPT_LFLOW,*/
-			IAC, WILL, TELOPT_ECHO,
-			IAC, WILL, TELOPT_SGA
+			IAC, WILL, TELOPT_ECHO, // "I will echo your chars"
+			// (Not really, _we_ won't - our programs in pty usually
+			// handle that. In practice, this says: "do not echo
+			// your user's input chars back to him _on your side_".)
+			IAC, WILL, TELOPT_SGA,  // "I assume full-duplex, won't send GA's"
+			//IAC, DO, TELOPT_ECHO, //WRONG: "can you echo my chars to me"??
+			IAC, DO, TELOPT_NAWS,   // "can you send me terminal size data?"
+			// This requires telnetd.ctrlSQ.patch (incomplete):
+			//IAC, DO, TELOPT_LFLOW,
 		};
+//Theoretically, our "WILL X" are requests and should only activate when client responds with "DO X".
+//However, we do not wait/check for "DO"s. Why?
+//There is nothing to "activate" on our side for TELOPT_ECHO.
+//For TELOPT_SGA, we don't even have code to support sending/understandig GAs,
+//so SGA is "always activated".
 		/* Just stuff it into TCP stream! (no error check...) */
 		safe_write(sockwr, iacs_to_send, sizeof(iacs_to_send));
 	}
