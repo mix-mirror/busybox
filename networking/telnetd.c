@@ -375,9 +375,9 @@ static int net_to_pty__have_data_to_write(void *this)
 
 	if (buf[1] >= 240 && buf[1] <= 249) {
 		/* 2-byte commands (240..250 and 255):
-		 * IAC IAC (255) Literal 255. Supported.
+		 * IAC IAC (255) Literal 255.
 		 * IAC SE  (240) End of subnegotiation. Treated as NOP.
-		 * IAC NOP (241) NOP. Supported.
+		 * IAC NOP (241) NOP.
 		 * IAC BRK (243) Break. Like serial line break. TODO via tcsendbreak()?
 		 * IAC AYT (246) Are you there.
 		 *  These don't look useful:
@@ -385,7 +385,7 @@ static int net_to_pty__have_data_to_write(void *this)
 		 * IAC IP  (244) Suspend, interrupt or abort the process. (Ancient cousin of ^C).
 		 * IAC AO  (245) Abort output. "You can continue running, but do not send me the output".
 		 * IAC EC  (247) Erase character. The receiver should delete the last received char.
-		 * IAC EL  (248) Erase line. The receiver should delete everything up tp last newline.
+		 * IAC EL  (248) Erase line. The receiver should delete everything up to last newline.
 		 * IAC GA  (249) Go ahead. For half-duplex lines: "now you talk".
 		 */
 		if (buf[1] == AYT && ts->sibling) /* notify other pipe that AYT was seen */
@@ -852,13 +852,13 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 	const int sockwr = sockrd != 0 ? sockrd : 1;
 	const char *login_argv[2];
 	struct termios termbuf;
-	int fd, pid;
+	int ptyfd, pid;
 	char tty_name[GETPTY_BUFSIZE];
 
-	/* Got a new connection, set up a tty */
-	fd = xgetpty(tty_name);
-	ndelay_on(fd);
-	close_on_exec_on(fd);
+	/* Got a new connection, set up a pty */
+	ptyfd = xgetpty(tty_name);
+	ndelay_on(ptyfd);
+	close_on_exec_on(ptyfd);
 
 	/* SO_KEEPALIVE by popular demand */
 	setsockopt_keepalive(sockrd);
@@ -885,7 +885,7 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 //Theoretically, our "WILL X" are requests and should only activate when client responds with "DO X".
 //However, we do not wait/check for "DO"s. Why?
 //There is nothing to "activate" on our side for TELOPT_ECHO.
-//For TELOPT_SGA, we don't even have code to support sending/understandig GAs,
+//For TELOPT_SGA, we don't even have code to support sending/understanding GAs,
 //so SGA is "always activated".
 		/* Just stuff it into TCP stream! (no error check...) */
 		safe_write(sockwr, iacs_to_send, sizeof(iacs_to_send));
@@ -894,8 +894,8 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 	fflush_all();
 	pid = vfork(); /* NOMMU-friendly */
 	if (pid < 0) {
-		close(fd);
-		/* socket will be closed by caller */
+		close(ptyfd);
+		close(sockrd);
 		bb_simple_perror_msg("vfork");
 		return;
 	}
@@ -904,8 +904,8 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 		pty_to_net_t *to_net;
 		net_to_pty_t *to_pty;
 
-		to_net = new_pty_to_net(fd, sockwr);
-		to_pty = new_net_to_pty(sockrd, fd);
+		to_net = new_pty_to_net(ptyfd, sockwr);
+		to_pty = new_net_to_pty(sockrd, ptyfd);
 		dbg("to_net:%p to_pty:%p", to_net, to_pty);
 		to_pty->sibling = to_net;
 		to_net->sibling = to_pty;
@@ -926,7 +926,7 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 	//pid = getpid(); // redundant, setsid gives us our pid
 	pid = setsid();
 
-	/* Open the child's side of the tty */
+	/* Open the child's side of the pty */
 	/* NB: setsid() disconnects from any previous ctty's. Therefore
 	 * we must open child's side of the tty AFTER setsid! */
 	close(0);
@@ -943,7 +943,7 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 			free(lsa);
 		}
 		write_new_utmp(pid, LOGIN_PROCESS, tty_name, /*username:*/ "LOGIN", hostname);
-		free(hostname);
+		IF_FEATURE_CLEAN_UP(free(hostname);)
 	}
 
 	/* The pseudo-terminal allocated to the client is configured to operate
@@ -969,8 +969,8 @@ static void make_new_session(ioloop_state_t *io, int sockrd)
 	login_argv[1] = NULL;
 	/* exec busybox applet (if PREFER_APPLETS=y), if that fails,
 	 * exec external program.
-	 * NB: sock is either 0 or has CLOEXEC set on it.
-	 * fd has CLOEXEC set on it too. These two fds will be closed here.
+	 * NB: sockrd is either 0 or has CLOEXEC set on it.
+	 * ptyfd has CLOEXEC set on it too. These two fds will be closed here.
 	 */
 	BB_EXECVP(G.loginpath, (char **)login_argv);
 	/* _exit is safer with vfork, and we shouldn't send message
@@ -1138,9 +1138,9 @@ static int test_vhangup(void)
 			last_change_ns = now_ns;
 		}
 
-		/* Exit if no change for 2 seconds */
+		/* Exit if no change for a few seconds */
 		if ((now_ns - last_change_ns) > 1000*1000*1000) {
-			bb_simple_info_msg("no change for 1 second, stopping read() loop");
+			bb_simple_info_msg("no change for 1 second, loop stopped");
 			break;
 		}
 
@@ -1248,6 +1248,7 @@ static int test_net_to_pty_data_integrity(void)
 			if (input_data[i + 1] == SB) {
 				/* IAC SB ... skip subnegotiation */
 				if (input_data[i + 2] == TELOPT_NAWS) {
+//TODO: simulate unusual NAWS
 					/* IAC SB TELOPT_NAWS [4 bytes] */
 					i += 3; /* skip IAC SB TELOPT_NAWS */
 					/* Skip 4 bytes of window size */
@@ -1338,7 +1339,7 @@ static int test_net_to_pty_data_integrity(void)
 		close(ptyfd);
 
 		slave_fd = xopen(tty_name, O_RDWR);
-		setsid(); /* this loses ctty (no tty signals ^C, ^Z, ^\; no SIGHUP on master close (probably?) */
+		setsid(); /* this loses ctty (no tty signals ^C, ^Z, ^\; no SIGHUP on master close (probably?)) */
 
 		tcgetattr(slave_fd, &termbuf);
 		cfmakeraw(&termbuf);
@@ -1372,7 +1373,7 @@ static int test_net_to_pty_data_integrity(void)
 				if (retry < 3) continue;
 				break; /* error (parent closed master) - expected */
 			}
-			/* If happens, probably kenel bug! */
+			/* If happens, probably kernel bug! */
 			if (retry != 0) bb_error_msg_and_die("READ DATA AFTER EOF/ERROR RETRY!!!");
 #if SAVE_NET2PTY_ACTUAL
 			xwrite(out_fd, read_buf, n);
@@ -1701,10 +1702,14 @@ int telnetd_main(int argc UNUSED_PARAM, char **argv)
 #if ENABLE_FEATURE_TELNETD_STANDALONE
 	else {
 		int master_fd = 0;
+		/* For -w SEC, listening socket is 0. Otherwise: */
 		if (!(opt & OPT_WAIT)) {
 			unsigned portnbr = CONFIG_FEATURE_TELNETD_PORT_DEFAULT;
 			if (opt & OPT_PORT)
 				portnbr = xatou16(opt_portnbr);
+			/* If someone would run "telnetd 0>&-", we can get terribly confused. */
+			/* Nake sure master_fd, or accept() result fd, etc, cant become 0 or 1: */
+			bb_sanitize_stdio();
 			master_fd = create_and_bind_stream_or_die(opt_bindaddr, portnbr);
 			xlisten(master_fd, 1);
 		}
@@ -1712,7 +1717,6 @@ int telnetd_main(int argc UNUSED_PARAM, char **argv)
 		ioloop_insert_conn(&G.io, (void *)new_accept_conn(master_fd));
 	}
 #endif
-
 	/* We don't want to die if just one session is broken */
 	signal(SIGPIPE, SIG_IGN);
 
