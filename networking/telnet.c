@@ -103,9 +103,6 @@ static char *bin_to_hex(const void *hash_value, unsigned hash_length)
 #endif
 
 enum {
-	BUFSIZE = 1024,
-	BUFMASK = BUFSIZE - 1,
-
 	TS_NORMAL = 0,
 	TS_IAC  = 1,
 	TS_OPT  = 2,
@@ -114,31 +111,24 @@ enum {
 	TS_CR   = 5,
 
 	MAX_NAWS_SIZE = 13, /* pathological 65535x65535 case needs full escaping */
+
+	netfd   = 3,
 };
 
 typedef unsigned char byte;
 
-enum { netfd = 3 };
-
 typedef struct stdin_to_net {
 	STRUCT_CONNECTION
 	int rdidx, wridx, size;
-	byte buf[BUFSIZE];
+	//byte buf[BUFSIZE];
 } stdin_to_net_t;
-
 typedef struct net_to_stdout {
 	STRUCT_CONNECTION
 	int rdidx, wridx, size;
 	byte input_state;
 	byte negotiation_verb;
-	byte buf[BUFSIZE];
+	//byte buf[BUFSIZE];
 } net_to_stdout_t;
-
-static int remaining_free_bytes(int n)
-{
-	return BUFSIZE - n;
-}
-
 #if DEBUG
 static void set_input_state(net_to_stdout_t *conn, int new_state, int c)
 {
@@ -155,7 +145,9 @@ static void set_input_state(net_to_stdout_t *conn, int new_state, int c)
 
 struct globals {
 	unsigned flags;
+/* Set when server agreed to use NAWS: */
 #define FLAGS_NAWS_ON  (1 << 0)
+/* SGA option seen and responded to, no longer look for it: */
 #define FLAGS_SGA_SEEN (1 << 1)
 /* Seen telnet protocol from server and sent our wishes: */
 #define INITIAL_SENT   (1 << 2)
@@ -183,12 +175,24 @@ struct globals {
 	net_to_stdout_t conn_net2stdout;
 	struct termios termios_def;
 	struct termios termios_raw;
+// buf[] arrays in conn structs are conceptually cleaner, but they
+// make G.member offsets larger -> larger code
+#define BUF_TTY2NET ((byte*)bb_common_bufsiz1)
+#define BUF_NET2TTY G.buf2
+#define BUFSIZE     1024
+/* Note: can't just increase BUFSIZE arbitrarily: common bufsiz1 is not guaranteed to be >1k! */
+#define BUFMASK     (BUFSIZE - 1)
+	byte        buf2[BUFSIZE];
 } FIX_ALIASING;
 #define G (*ptr_to_globals)
 #define INIT_G() do { \
 	SET_PTR_TO_GLOBALS(xzalloc(sizeof(G))); \
 } while (0)
 
+static int remaining_free_bytes(int n)
+{
+	return BUFSIZE - n;
+}
 
 #if ENABLE_FEATURE_TELNET_WIDTH
 static void handle_SIGWINCH(int sig UNUSED_PARAM)
@@ -221,7 +225,7 @@ static void put_iac(int c)
 {
 	stdin_to_net_t *conn = &G.conn_stdin2net;
 	/* Write directly to stdin2net buffer */
-	conn->buf[conn->rdidx] = c; /* "... & 0xff" is implicit */
+	BUF_TTY2NET[conn->rdidx] = c; /* "... & 0xff" is implicit */
 	conn->rdidx = (conn->rdidx + 1) & BUFMASK;
 	conn->size++;
 }
@@ -528,7 +532,7 @@ static int read_from_stdin(void *this)
 	if (count == 0)
 		return 0;
 
-	start = conn->buf + conn->rdidx;
+	start = BUF_TTY2NET + conn->rdidx;
 	count = safe_read(conn->read_fd, start, count);
 	if (count <= 0) {
 		conn->read_fd = -1;
@@ -606,7 +610,7 @@ static int write_to_net(void *this)
 		handle_changes_in_options(conn); /* yes */
 
 	count = MIN(BUFSIZE - conn->wridx, conn->size);
-	count = safe_write(conn->write_fd, conn->buf + conn->wridx, count);
+	count = safe_write(conn->write_fd, BUF_TTY2NET + conn->wridx, count);
 	if (count <= 0) {
 		if (count < 0 && errno == EAGAIN)
 			return 0;
@@ -647,7 +651,7 @@ static int read_from_net(void *this)
 	count = MIN(BUFSIZE - conn->rdidx, count); /* can't be zero */
 
 	/* Read directly into circular buffer's linear fragment */
-	dst = conn->buf + conn->rdidx;
+	dst = BUF_NET2TTY + conn->rdidx;
 	count = safe_read(conn->read_fd, dst, count);
 	dbg("read_from_net bytes:%d input_state:%d %s",
 		count, conn->input_state, bin_to_hex(dst, count > 0 ? count : 0));
@@ -804,7 +808,7 @@ static int read_from_net(void *this)
 	}
 
 	/* Update circular buffer: only the compacted data */
-	count = dst - (conn->buf + conn->rdidx);
+	count = dst - (BUF_NET2TTY + conn->rdidx);
 	conn->size += count;
 	conn->rdidx = (conn->rdidx + count) & BUFMASK;
 
@@ -831,8 +835,8 @@ static int write_to_stdout(void *this)
 	int wr = MIN(BUFSIZE - conn->wridx, conn->size);
 	ssize_t count;
 
-	dbg("write_to_stdout: wr:%d %s", wr, bin_to_hex(conn->buf + conn->wridx, wr));
-	count = safe_write(conn->write_fd, conn->buf + conn->wridx, wr);
+	dbg("write_to_stdout: wr:%d %s", wr, bin_to_hex(BUF_NET2TTY + conn->wridx, wr));
+	count = safe_write(conn->write_fd, BUF_NET2TTY + conn->wridx, wr);
 	if (count <= 0) {
 		if (count < 0 && errno == EAGAIN)
 			return 0;
