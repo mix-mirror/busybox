@@ -164,8 +164,8 @@ struct globals {
 #define INITIAL_SENT    (1 << 2)
 #define DO_TERMIOS      (1 << 3)
 
-	byte            word_aligned_bytes[2];
-#define changed         word_aligned_bytes[0]
+	byte                word_aligned_bytes[2];
+#define changes_seen        word_aligned_bytes[0]
 #define CHANGED_ECHO        (1 << 0)
 #define CHANGED_NAWS        (1 << 1)
 // These happen only once:
@@ -173,14 +173,17 @@ struct globals {
 #define CHANGED_TTYPE       (1 << 3)
 #define CHANGED_NEW_ENVIRON (1 << 4)
 // The second byte is changed async, by signal handler:
-#define got_SIGWINCH    word_aligned_bytes[1]
-#define G_changed_word  (*(uint16_t*)G.word_aligned_bytes)
+#define got_SIGWINCH        word_aligned_bytes[1]
+#define G_changes_or_WINCH  (*(uint16_t*)G.word_aligned_bytes)
+// The "shared word" trick is unsafe on only-word-store arches such as DEC Alpha or SHARC,
+// but Alpha retired in 2004 and SHARC does not run linux (it's a DSP).
 
 	byte            optstate_ECHO;
-#define OPT_ECHO_ON      1
-// We operate tty in rawmode only when echo ON (IOW: we saw server say that)
+// On program start:
+#define OPT_ECHO_UNKNOWN 0xff
 #define OPT_ECHO_OFF     0
-#define OPT_ECHO_UNKNOWN 0xff /* on program start */
+// We operate tty in rawmode only when echo ON (IOW: we saw server say that)
+#define OPT_ECHO_ON      1
 
 	byte            echo_sga_response_size;
 
@@ -405,7 +408,7 @@ static void handle_changes_in_options(stdin_to_net_t *conn)
 {
 	int count;
 
-	log1("changed:%x flags:%x", G.changed, G.flags);
+	log1("changed:%x flags:%x", G.changes_seen, G.flags);
 
 	count = remaining_free_bytes(conn->size);
 	// As soon as we see any DO/DONT/WILL/WONT known to us,
@@ -417,26 +420,26 @@ static void handle_changes_in_options(stdin_to_net_t *conn)
 	// only if that option was requested.
 	// We repeatedly send only NAWS (when our window changes).
 	// Repeated DO requests are ignored.
-	if (G.changed
+	if (G.changes_seen
 	 && (count >= G.echo_sga_response_size)
 	) {
-		if (G.changed & CHANGED_ECHO) {
+		if (G.changes_seen & CHANGED_ECHO) {
 			// Server said WILL/WONT ECHO - confirm every time
 			log1("C:%s ECHO", G.optstate_ECHO ? "DO" : "DONT");
 			put_iac3_IAC_x_y(G.optstate_ECHO ? DO : DONT, TELOPT_ECHO);
 		}
-		if (G.changed & CHANGED_SGA) {
+		if (G.changes_seen & CHANGED_SGA) {
 			// Server said WILL SGA - confirm once
 			log1("C:DO SGA");
 			put_iac3_IAC_x_y(DO, TELOPT_SGA);
 			G.flags |= FLAGS_SGA_SEEN; // remember we did it
-			G.changed -= CHANGED_SGA;
+			G.changes_seen -= CHANGED_SGA;
 		}
-		G.changed &= ~(CHANGED_ECHO|CHANGED_SGA);
+		G.changes_seen &= ~(CHANGED_ECHO|CHANGED_SGA);
 
 		if (!(G.flags & INITIAL_SENT)) {
 			// From now on, we'll only do DO/DONT ECHO and maybe DO SGA
-			// in the "if (G.changed)" block.
+			// in the "if (G.changes_seen)" block.
 			G.flags |= INITIAL_SENT;
 			G.echo_sga_response_size = (G.flags & FLAGS_SGA_SEEN) ? 3 : 6;
 
@@ -466,9 +469,9 @@ static void handle_changes_in_options(stdin_to_net_t *conn)
 	// Therefore we always send WILL X before SB X...
 #if ENABLE_FEATURE_TELNET_WIDTH
 	if (remaining_free_bytes(conn->size) > MAX_NAWS_SIZE) {
-		if (G.changed & CHANGED_NAWS) {
+		if (G.changes_seen & CHANGED_NAWS) {
 			G.flags |= FLAGS_NAWS_ON; // remember we did it
-			G.changed -= CHANGED_NAWS;
+			G.changes_seen -= CHANGED_NAWS;
 			goto generate_naws;
 		}
 		// Handle window resize: send updated NAWS
@@ -484,23 +487,23 @@ static void handle_changes_in_options(stdin_to_net_t *conn)
 	}
 #endif
 #if ENABLE_FEATURE_TELNET_TTYPE
-	if ((G.changed & CHANGED_TTYPE)
+	if ((G.changes_seen & CHANGED_TTYPE)
 	 && remaining_free_bytes(conn->size) > 6 + 2 * strlen(G.ttype)
 	) {
 		log1("C:SB %s '%s'", "TTYPE", G.ttype);
 		put_iac_subopt(TELOPT_TTYPE, G.ttype);
 		G.ttype = NULL; // remember we did it
-		G.changed -= CHANGED_TTYPE;
+		G.changes_seen -= CHANGED_TTYPE;
 	}
 #endif
 #if ENABLE_FEATURE_TELNET_AUTOLOGIN
-	if ((G.changed & CHANGED_NEW_ENVIRON)
+	if ((G.changes_seen & CHANGED_NEW_ENVIRON)
 	 && remaining_free_bytes(conn->size) > 12 + 2 * strlen(G.autologin)
 	) {
 		log1("C:SB %s '%s'", "NEW_ENVIRON", G.autologin);
 		put_iac_subopt_autologin(G.autologin);
 		G.autologin = NULL; // remember we did it
-		G.changed -= CHANGED_NEW_ENVIRON;
+		G.changes_seen -= CHANGED_NEW_ENVIRON;
 	}
 #endif
 }
@@ -556,7 +559,7 @@ static void show_menu(void)
 			announce_rawmode(); /* no "_and_switch_": we are already in rawmode */
  echo_changed:
 			if (G.flags & INITIAL_SENT)
-				G.changed |= CHANGED_ECHO; /* inform the server at next send */
+				G.changes_seen |= CHANGED_ECHO; /* inform the server at next send */
 			return;
 		}
 		break;
@@ -663,7 +666,7 @@ static int have_data_to_write_to_net(void *this)
 		ioloop_remove_conn(conn->io, (connection_t*)conn);
 		return -1;
 	}
-	return conn->size > 0 || G_changed_word != 0;
+	return conn->size > 0 || G_changes_or_WINCH != 0;
 }
 
 static int write_to_net(void *this)
@@ -672,10 +675,13 @@ static int write_to_net(void *this)
 	int count;
 
 	/* Do we have option or NAWS changes to handle? */
-	if (G_changed_word)
+	if (G_changes_or_WINCH)
 		handle_changes_in_options(conn); /* yes */
 
 	count = MIN(BUFSIZE - conn->wridx, conn->size);
+	// can be zero due to handle_changes_in_options()
+	if (count == 0)
+		return 0;
 	count = safe_write(conn->write_fd, BUF_TTY2NET + conn->wridx, count);
 	if (count <= 0) {
 		if (count < 0 && errno == EAGAIN)
@@ -814,7 +820,7 @@ static int read_from_net(void *this)
 					break;
 				case TELOPT_SGA: /* Remote option: "suppress go ahead" */
 					if (will && !(G.flags & FLAGS_SGA_SEEN))
-						G.changed |= CHANGED_SGA;
+						G.changes_seen |= CHANGED_SGA;
 					break;
 				}
 			} else if (conn->negotiation_verb == DO) {
@@ -823,19 +829,19 @@ static int read_from_net(void *this)
 				case TELOPT_TTYPE: /* Local option: we send terminal type */
 					log1("TTYPE:'%s' %ssetting CHANGED_TTYPE", G.ttype, G.ttype ? "" : "not ");
 					if (G.ttype)
-						G.changed |= CHANGED_TTYPE;
+						G.changes_seen |= CHANGED_TTYPE;
 					break;
 #endif
 #if ENABLE_FEATURE_TELNET_AUTOLOGIN
 				case TELOPT_NEW_ENVIRON: /* Local option: we send username */
 					if (G.autologin)
-						G.changed |= CHANGED_NEW_ENVIRON;
+						G.changes_seen |= CHANGED_NEW_ENVIRON;
 					break;
 #endif
 #if ENABLE_FEATURE_TELNET_WIDTH
 				case TELOPT_NAWS: /* Local option: we send window size */
 					if (!(G.flags & FLAGS_NAWS_ON))
-						G.changed |= CHANGED_NAWS;
+						G.changes_seen |= CHANGED_NAWS;
 					break;
 #endif
 				}
@@ -873,7 +879,7 @@ static int read_from_net(void *this)
 
 	if (oldstate_ECHO != G.optstate_ECHO) {
 		/* Tell net writer to generate a confirmation */
-		G.changed |= CHANGED_ECHO;
+		G.changes_seen |= CHANGED_ECHO;
 		/* Print the banner and set termios */
 		if (G.optstate_ECHO == OPT_ECHO_ON)
 			announce_and_switch_to_rawmode();
