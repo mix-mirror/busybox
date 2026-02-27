@@ -201,9 +201,10 @@ struct globals {
 #if ENABLE_FEATURE_LESS_WINCH
 	unsigned winch_counter;
 #endif
-	ssize_t eof_error; /* eof if 0, error if < 0 */
-	ssize_t readpos;
-	ssize_t readeof; /* must be signed */
+	int stdin_GETFL_flags;
+	ssize_t eof_error; /* eof if 0, error if < 0, > 0 if last read got some chars */
+	size_t readpos;
+	size_t read_size;
 	const char **buffer;
 	const char **flines;
 	const char *empty_line_marker;
@@ -253,7 +254,7 @@ struct globals {
 #define WINCH_COUNTER (*(volatile unsigned *)&winch_counter)
 #define eof_error           (G.eof_error         )
 #define readpos             (G.readpos           )
-#define readeof             (G.readeof           )
+#define read_size           (G.read_size         )
 #define buffer              (G.buffer            )
 #define flines              (G.flines            )
 #define empty_line_marker   (G.empty_line_marker )
@@ -458,7 +459,7 @@ static int at_end(void)
  *      that it was seen])
  * max_lineno - last line's number, this one doesn't increment
  *      on line wrap, only on "real" new lines.
- * readbuf[0..readeof-1] - small preliminary buffer.
+ * readbuf[0..read_size-1] - small preliminary buffer.
  * readbuf[readpos] - next character to add to current line.
  * last_line_pos - screen line position of next char to be read
  *      (takes into account tabs and backspaces)
@@ -472,8 +473,6 @@ static void read_lines(void)
 	char *current_line, *p;
 	int w = width;
 	char last_terminated = terminated;
-	time_t last_time = 0;
-	int retry_EAGAIN = 2;
 #if ENABLE_FEATURE_LESS_REGEXP
 	unsigned old_max_fline = max_fline;
 #endif
@@ -505,30 +504,23 @@ static void read_lines(void)
 		while (1) { /* read chars until we have a line */
 			char c;
 			/* if no unprocessed chars left, eat more */
-			if (readpos >= readeof) {
-				int flags = ndelay_on(0);
+			if (readpos >= read_size) {
+				// Read stdin, temporarily making it nonblocking (if it's not already).
+				// NB: we do NOT check eof_error status before reading.
+				// This has the effect that e.g. PageDown on a regular file
+				// where we already reached EOF *will try reading anyway*,
+				// if the file is a growing log file, less *will* show the new data.
+				int flags = G.stdin_GETFL_flags;
+				if (!(flags & O_NONBLOCK))
+					fcntl(STDIN_FILENO, F_SETFL, flags|O_NONBLOCK);
+				eof_error = safe_read(STDIN_FILENO, readbuf, COMMON_BUFSIZE);
+				if (!(flags & O_NONBLOCK))
+					fcntl(STDIN_FILENO, F_SETFL, flags);
 
-				while (1) {
-					time_t t;
-
-					errno = 0;
-					eof_error = safe_read(STDIN_FILENO, readbuf, COMMON_BUFSIZE);
-					if (errno != EAGAIN)
-						break;
-					t = time(NULL);
-					if (t != last_time) {
-						last_time = t;
-						if (--retry_EAGAIN < 0)
-							break;
-					}
-					sched_yield();
-				}
-				fcntl(0, F_SETFL, flags); /* ndelay_off(0) */
 				readpos = 0;
-				readeof = eof_error;
+				read_size = (eof_error < 0 ? 0 : eof_error);
 				if (eof_error <= 0)
 					goto reached_eof;
-				retry_EAGAIN = 1;
 			}
 			c = readbuf[readpos];
 			/* backspace? [needed for manpages] */
@@ -632,7 +624,7 @@ static void read_lines(void)
 
 	if (eof_error < 0) {
 		if (errno == EAGAIN) {
-			eof_error = 1;
+			eof_error = 1; /* "neither EOF nor error" */
 		} else {
 			print_statusline(bb_msg_read_error);
 		}
@@ -914,7 +906,7 @@ static void buffer_print(void)
 	if ((option_mask32 & (FLAG_E|FLAG_F))
 	 && eof_error <= 0
 	) {
-		i = option_mask32 & FLAG_F ? 0 : cur_fline;
+		i = (option_mask32 & FLAG_F) ? 0 : cur_fline;
 		if (max_fline - i <= max_displayed_line)
 			less_exit();
 	}
@@ -1063,8 +1055,9 @@ static void open_file_and_read_lines(void)
 		num_lines = REOPEN_STDIN;
 #endif
 	}
+	G.stdin_GETFL_flags = fcntl(STDIN_FILENO, F_GETFL);
 	readpos = 0;
-	readeof = 0;
+	read_size = 0;
 	last_line_pos = 0;
 	terminated = 1;
 	read_lines();
@@ -1093,9 +1086,13 @@ static void reinitialize(void)
 	buffer_fill_and_print();
 }
 
+/* Poll stdin and keyboard.
+ * If stdin has more data, redraw and repeat.
+ * Return keycode when a key is pressed.
+ */
 static int64_t getch_nowait(void)
 {
-	int rd;
+	int dont_poll_stdin;
 	int64_t key64;
 	struct pollfd pfd[2];
 
@@ -1111,11 +1108,11 @@ static int64_t getch_nowait(void)
 	 * Even if select/poll says that input is available, read CAN block
 	 * (switch fd into O_NONBLOCK'ed mode to avoid it)
 	 */
-	rd = 1;
+	dont_poll_stdin = 1;
 	/* Are we interested in stdin? */
 	if (at_end()) {
 		if (eof_error > 0) /* did NOT reach eof yet */
-			rd = 0; /* yes, we are interested in stdin */
+			dont_poll_stdin = 0; /* yes, we are interested in stdin */
 	}
 	/* Position cursor if line input is done */
 	if (less_gets_pos >= 0)
@@ -1127,21 +1124,24 @@ static int64_t getch_nowait(void)
 		while (1) {
 			int r;
 			/* NB: SIGWINCH interrupts poll() */
-			r = poll(pfd + rd, 2 - rd, -1);
+			r = poll(pfd + dont_poll_stdin, 2 - dont_poll_stdin, -1);
 			if (/*r < 0 && errno == EINTR &&*/ winch_counter)
 				return '\\'; /* anything which has no defined function */
 			if (r) break;
 		}
 #else
-		safe_poll(pfd + rd, 2 - rd, -1);
+		safe_poll(pfd + dont_poll_stdin, 2 - dont_poll_stdin, -1);
 #endif
 	}
 
+	if (pfd[1].revents == 0)
+		goto no_kbd_input;
 	/* We have kbd_fd in O_NONBLOCK mode, read inside safe_read_key()
 	 * would not block even if there is no input available */
 	key64 = safe_read_key(kbd_fd, kbd_input, /*do not poll:*/ -2);
 	if ((int)key64 == -1) {
 		if (errno == EAGAIN) {
+ no_kbd_input:
 			/* No keyboard input available. Since poll() did return,
 			 * we should have input on stdin */
 			read_lines();
