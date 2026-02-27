@@ -529,7 +529,7 @@ static void read_lines(void)
 				readpos = 0;
 				read_size = G.eof_error_ok;
 				if (G.eof_error_ok <= 0) {
-					read_size = 0; // -1 would be seen as UNIT_MAX, prevent
+					read_size = 0; // -1 would be seen as UINT_MAX, prevent
 					if (G.eof_error_ok < 0 && errno == EAGAIN)
 						G.eof_error_ok = 1; // "neither EOF nor error"
 					goto reached_eof;
@@ -637,10 +637,13 @@ static void read_lines(void)
 	if (ndelay_set == 0) // stdin was not nonblocking, restore that
 		fcntl(STDIN_FILENO, F_SETFL, fdflags);
 
-	if (G.eof_error_ok < 0) // error?
-		print_statusline(bb_msg_read_error);
+	// Will not be seen (overwritten immediately)
+	//if (G.eof_error_ok < 0) { // error?
+	//	print_statusline(bb_msg_read_error);
+	//	bb_error_msg("G.eof_error_ok:%d", G.eof_error_ok); sleep(5);
+	//} else
 #if ENABLE_FEATURE_LESS_FLAGS
-	else if (G.eof_error_ok == 0) // EOF?
+	if (G.eof_error_ok == 0) // EOF?
 		num_lines = max_lineno;
 #endif
 
@@ -715,17 +718,17 @@ static void m_status_print(void)
 	clear_line();
 	printf(HIGHLIGHT"%s", filename);
 	if (num_files > 1)
-		printf(" (file %i of %i)", current_file, num_files);
+		printf(" (file %d of %d)", current_file, num_files);
 
 	first = safe_lineno(cur_fline);
 	last = (option_mask32 & FLAG_S)
 			? MIN(first + max_displayed_line, max_lineno)
 			: safe_lineno(cur_fline + max_displayed_line);
-	printf(" lines %i-%i", first, last);
+	printf(" lines %d-%d", first, last);
 
 	update_num_lines();
 	if (num_lines >= 0)
-		printf("/%i", num_lines);
+		printf("/%d", num_lines);
 
 	if (at_end()) {
 		printf(" (END)");
@@ -733,8 +736,11 @@ static void m_status_print(void)
 			printf(" - next: %s", files[current_file]);
 	} else if (num_lines > 0) {
 		percent = (100 * last + num_lines/2) / num_lines;
-		printf(" %i%%", percent <= 100 ? percent : 100);
+		printf(" %d%%", percent <= 100 ? percent : 100);
 	}
+	if (G.eof_error_ok < 0)
+		// Reproducer: strace -oLOG -e fault=read:error=EIO:when=2 less FILE
+		printf(" %s", bb_msg_read_error);
 	printf(NORMAL);
 }
 #endif
@@ -764,6 +770,9 @@ static void status_print(void)
 	p = "(END)";
 	if (!cur_fline)
 		p = filename;
+	if (G.eof_error_ok < 0)
+		// Reproducer: strace -oLOG -e fault=read:error=EIO:when=2 less FILE
+		p = bb_msg_read_error;
 	if (num_files > 1) {
 		printf(HIGHLIGHT"%s (file %i of %i)"NORMAL,
 				p, current_file, num_files);
@@ -1137,7 +1146,7 @@ static int64_t getch_nowait(void)
 			int r;
 			/* NB: SIGWINCH interrupts poll() */
 			r = poll(pfd + dont_poll_stdin, 2 - dont_poll_stdin, -1);
-			if (/*r < 0 && errno == EINTR &&*/ winch_counter)
+			if (/*r < 0 && errno == EINTR &&*/ winch_counter != 0)
 				return '\\'; /* anything which has no defined function */
 			if (r) break;
 		}
@@ -1927,7 +1936,7 @@ int less_main(int argc, char **argv)
 		int64_t keypress;
 
 #if ENABLE_FEATURE_LESS_WINCH
-		while (WINCH_COUNTER) {
+		while (WINCH_COUNTER != 0) {
  again:
 			winch_counter--;
 			IF_FEATURE_LESS_ASK_TERMINAL(G.winsize_err =) get_terminal_width_height(kbd_fd, &width, &max_displayed_line);
