@@ -157,7 +157,7 @@ SKIP=
 # Create an archive containing a file with "../dont_write" filename.
 # See that it will not be allowed to unpack.
 # NB: GNU cpio 2.15 DOES NOT do such checks.
-optional FEATURE_PATH_TRAVERSAL_PROTECTION
+optional FEATURE_PATH_TRAVERSAL_PROTECTION FEATURE_CPIO_O
 rm -rf cpio.testdir
 mkdir -p cpio.testdir/prepare/inner
 echo "file outside of destination was written" > cpio.testdir/prepare/dont_write
