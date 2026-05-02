@@ -1574,7 +1574,11 @@ extern smallint logmode;
 extern uint8_t xfunc_error_retval;
 extern void (*die_func)(void);
 void xfunc_die(void) NORETURN FAST_FUNC;
+#if !ENABLE_SHOW_USAGE
+#define bb_show_usage() xfunc_die()
+#else
 void bb_show_usage(void) NORETURN FAST_FUNC;
+#endif
 void bb_error_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2))) FAST_FUNC;
 void bb_simple_error_msg(const char *s) FAST_FUNC;
 void bb_error_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2))) FAST_FUNC;
